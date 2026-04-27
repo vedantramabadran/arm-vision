@@ -1,0 +1,20 @@
+# Edge Impulse SDK (large, don't commit)
+edge_impulse_model/
+
+# Model files
+*.eim
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
