@@ -74,8 +74,32 @@ def pixel_to_angle(px, py, cal):
 
 # ========================= CALIBRATION MODE =========================
 
+def find_circle_center(p1, p2, p3):
+    """Find center of circle through 3 points (= arm base position)."""
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+
+    # Solve: 2(x2-x1)cx + 2(y2-y1)cy = x2²-x1² + y2²-y1²
+    #        2(x3-x2)cx + 2(y3-y2)cy = x3²-x2² + y3²-y2²
+    A = np.array([
+        [2 * (x2 - x1), 2 * (y2 - y1)],
+        [2 * (x3 - x2), 2 * (y3 - y2)],
+    ])
+    B = np.array([
+        x2**2 - x1**2 + y2**2 - y1**2,
+        x3**2 - x2**2 + y3**2 - y2**2,
+    ])
+
+    try:
+        center = np.linalg.solve(A, B)
+        return float(center[0]), float(center[1])
+    except np.linalg.LinAlgError:
+        return None
+
+
 def calibrate():
-    """Click arm base + 2 points at known angles the camera can see."""
+    """Click 3 points at known angles. Arm base is computed automatically."""
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         print("ERROR: Could not open camera")
@@ -85,30 +109,22 @@ def calibrate():
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     clicks = []
-    angles = []  # user-entered angles for clicks 2 and 3
-
-    prompts = [
-        "Click on the ARM BASE",
-        "Place object at a KNOWN angle, click on it",
-        "Place object at a DIFFERENT known angle, click on it",
-    ]
+    angles = []
 
     def on_click(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(clicks) <= len(angles) + 1 and len(clicks) < 3:
+        if event == cv2.EVENT_LBUTTONDOWN and len(clicks) == len(angles) and len(clicks) < 3:
             clicks.append((x, y))
             print(f"  Recorded click: ({x}, {y})")
-            if len(clicks) >= 2:
-                print(f"  Now type the arm angle for that point in the terminal (e.g. 30): ", end="", flush=True)
+            print(f"  Type the arm angle for this point (e.g. 30): ", end="", flush=True)
 
     cv2.namedWindow("Calibration")
     cv2.setMouseCallback("Calibration", on_click)
 
     print("=== CALIBRATION ===")
-    print("1. Click the arm base")
-    print("2. Place object at a known angle the camera CAN see (e.g. 30°)")
-    print("   Click on it, then type the angle in the terminal")
-    print("3. Repeat for a second known angle (e.g. 60°)")
-    print("4. Press 's' to save, 'r' to redo")
+    print("Place object at 3 different known angles along the arm's arc.")
+    print("For each: click on the object, then type its angle in the terminal.")
+    print("Example: place at 20°, 45°, 70° (spread them out for accuracy)")
+    print("Press 'r' to redo, 's' to save when all 3 are done.")
     print()
 
     while True:
@@ -127,38 +143,24 @@ def calibrate():
         frame = cv2.resize(cropped, (MODEL_INPUT_W, MODEL_INPUT_H))
 
         # Draw existing clicks
-        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+        colors = [(0, 255, 0), (255, 255, 0), (255, 0, 0)]
         for i, (cx, cy) in enumerate(clicks):
             cv2.circle(frame, (cx, cy), 6, colors[i], -1)
-            if i == 0:
-                lbl = "BASE"
-            elif i - 1 < len(angles):
-                lbl = f"{angles[i-1]} deg"
+            if i < len(angles):
+                lbl = f"{angles[i]} deg"
             else:
                 lbl = "? deg"
             cv2.putText(frame, lbl, (cx + 10, cy - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[i], 2)
 
-        # Draw lines from base to calibration points
-        if len(clicks) >= 2:
-            cv2.line(frame, clicks[0], clicks[1], (0, 255, 0), 1)
-        if len(clicks) >= 3:
-            cv2.line(frame, clicks[0], clicks[2], (255, 0, 0), 1)
-
         # Show prompt
-        if len(clicks) < 3:
-            step = len(clicks)
-            if step > 0 and len(angles) < step - 1:
-                msg = "Type the angle in the terminal..."
-            elif step < len(prompts):
-                msg = prompts[step]
-            else:
-                msg = "Type the angle in the terminal..."
+        done = len(clicks) == 3 and len(angles) == 3
+        if done:
+            msg = "Press 's' to save, 'r' to redo"
+        elif len(clicks) > len(angles):
+            msg = "Type the angle in the terminal..."
         else:
-            if len(angles) < 2:
-                msg = "Type the angle in the terminal..."
-            else:
-                msg = "Press 's' to save, 'r' to redo"
+            msg = f"Click on object at known angle ({len(clicks)+1}/3)"
 
         cv2.putText(frame, msg, (5, 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
@@ -167,7 +169,7 @@ def calibrate():
         key = cv2.waitKey(50) & 0xFF
 
         # Check if user needs to enter an angle
-        if len(clicks) >= 2 and len(angles) < len(clicks) - 1:
+        if len(clicks) > len(angles):
             try:
                 import select
                 if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
@@ -175,10 +177,9 @@ def calibrate():
                     if line:
                         angles.append(float(line))
                         print(f"  Angle recorded: {angles[-1]}°")
-                        if len(angles) < 2:
-                            print(f"\n  Now place object at a different angle and click on it.")
+                        if len(angles) < 3:
+                            print(f"\n  Place object at next angle and click ({len(angles)+1}/3)")
             except (ImportError, OSError):
-                # Windows doesn't support select on stdin
                 import msvcrt
                 if msvcrt.kbhit():
                     line = ""
@@ -190,8 +191,8 @@ def calibrate():
                     if line:
                         angles.append(float(line))
                         print(f"\n  Angle recorded: {angles[-1]}°")
-                        if len(angles) < 2:
-                            print(f"\n  Now place object at a different angle and click on it.")
+                        if len(angles) < 3:
+                            print(f"\n  Place object at next angle and click ({len(angles)+1}/3)")
 
         if key == ord("q"):
             break
@@ -199,32 +200,42 @@ def calibrate():
             clicks.clear()
             angles.clear()
             print("\nReset. Click again.")
-        elif key == ord("s") and len(clicks) == 3 and len(angles) == 2:
-            bx, by = clicks[0]
-            x1, y1 = clicks[1]
-            x2, y2 = clicks[2]
+        elif key == ord("s") and done:
+            # Find arm base from 3 points on the arc
+            result = find_circle_center(clicks[0], clicks[1], clicks[2])
+            if result is None:
+                print("\nERROR: Points are collinear - can't find circle center.")
+                print("Make sure the 3 points are spread along the arc, not in a line.")
+                clicks.clear()
+                angles.clear()
+                continue
 
-            # Raw pixel angles from base
-            raw1 = math.atan2(y1 - by, x1 - bx)
-            raw2 = math.atan2(y2 - by, x2 - bx)
+            bx, by = result
+            radius = math.sqrt((clicks[0][0] - bx)**2 + (clicks[0][1] - by)**2)
 
-            # Handle atan2 wraparound - unwrap raw2 to be close to raw1
-            while raw2 - raw1 > math.pi:
-                raw2 -= 2 * math.pi
-            while raw2 - raw1 < -math.pi:
-                raw2 += 2 * math.pi
+            # Compute raw pixel angles from base for each point
+            raws = []
+            for (px, py) in clicks:
+                raws.append(math.atan2(py - by, px - bx))
 
-            # Linear fit: raw_angle = m * arm_degree + b
-            a1, a2 = angles[0], angles[1]
-            m = (raw2 - raw1) / (a2 - a1)
-            b = raw1 - m * a1
+            # Unwrap angles to be monotonic
+            for i in range(1, len(raws)):
+                while raws[i] - raws[i-1] > math.pi:
+                    raws[i] -= 2 * math.pi
+                while raws[i] - raws[i-1] < -math.pi:
+                    raws[i] += 2 * math.pi
+
+            # Least squares linear fit: raw = m * arm_degree + b
+            A_fit = np.array([[a, 1] for a in angles])
+            B_fit = np.array(raws)
+            result_fit, _, _, _ = np.linalg.lstsq(A_fit, B_fit, rcond=None)
+            m, b = float(result_fit[0]), float(result_fit[1])
 
             cal = {
-                "base": [bx, by],
-                "point_1": [x1, y1],
-                "point_2": [x2, y2],
-                "angle_1": a1,
-                "angle_2": a2,
+                "base": [round(bx, 1), round(by, 1)],
+                "radius": round(radius, 1),
+                "points": [[int(c[0]), int(c[1])] for c in clicks],
+                "angles": angles,
                 "m": m,
                 "b": b,
             }
@@ -232,10 +243,11 @@ def calibrate():
                 json.dump(cal, f, indent=2)
 
             print(f"\nCalibration saved to {CALIBRATION_FILE}")
-            print(f"  Base:     ({bx}, {by})")
-            print(f"  Point 1:  ({x1}, {y1}) = {a1}°")
-            print(f"  Point 2:  ({x2}, {y2}) = {a2}°")
-            print(f"  Mapping:  raw = {m:.4f} * degree + {b:.4f}")
+            print(f"  Arm base (computed): ({bx:.1f}, {by:.1f}) - off-screen is OK!")
+            print(f"  Arm radius: {radius:.1f} px")
+            for i in range(3):
+                print(f"  Point {i+1}: {clicks[i]} = {angles[i]}°")
+            print(f"  Mapping: raw = {m:.4f} * degree + {b:.4f}")
             break
 
     cap.release()
