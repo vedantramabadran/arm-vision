@@ -4,6 +4,7 @@ edge_impulse_model/
 # Model files
 *.eim
 *.zip
+!model.tflite
 
 # Python
 __pycache__/
