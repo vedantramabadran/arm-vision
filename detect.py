@@ -3,8 +3,8 @@
 Object detection with pixel-to-angle mapping for robot arm.
 
 Usage:
-  python detect.py --calibrate   Calibrate: click arm base, 0° point, 90° point
-  python detect.py               Run detection, outputs angle 0-90° for each object
+  python detect.py --calibrate   Calibrate: click 3 points at known angles
+  python detect.py               Run detection, outputs angle 0-90 for each object
 """
 
 import cv2
@@ -55,9 +55,6 @@ def pixel_to_angle(px, py, cal):
     bx, by = cal["base"]
     raw = math.atan2(py - by, px - bx)
 
-    # Linear mapping: two known (raw_angle -> arm_degree) pairs
-    # raw = m * arm_degree + b
-    # Solve for arm_degree = (raw - b) / m
     m = cal["m"]
     b = cal["b"]
 
@@ -80,8 +77,6 @@ def find_circle_center(p1, p2, p3):
     x2, y2 = p2
     x3, y3 = p3
 
-    # Solve: 2(x2-x1)cx + 2(y2-y1)cy = x2²-x1² + y2²-y1²
-    #        2(x3-x2)cx + 2(y3-y2)cy = x3²-x2² + y3²-y2²
     A = np.array([
         [2 * (x2 - x1), 2 * (y2 - y1)],
         [2 * (x3 - x2), 2 * (y3 - y2)],
@@ -98,6 +93,19 @@ def find_circle_center(p1, p2, p3):
         return None
 
 
+def grab_frame(cap, cam_w, cam_h):
+    """Capture one frame, crop and resize to 320x320."""
+    ret, frame = cap.read()
+    if not ret:
+        return None
+    if cam_w != cam_h:
+        size = min(cam_w, cam_h)
+        x_off = (cam_w - size) // 2
+        y_off = (cam_h - size) // 2
+        frame = frame[y_off:y_off + size, x_off:x_off + size]
+    return cv2.resize(frame, (MODEL_INPUT_W, MODEL_INPUT_H))
+
+
 def calibrate():
     """Click 3 points at known angles. Arm base is computed automatically."""
     cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -110,37 +118,44 @@ def calibrate():
 
     clicks = []
     angles = []
+    need_click = [True]  # waiting for a click (not an angle)
 
     def on_click(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(clicks) == len(angles) and len(clicks) < 3:
+        if event == cv2.EVENT_LBUTTONDOWN and need_click[0] and len(clicks) < 3:
             clicks.append((x, y))
-            print(f"  Recorded click: ({x}, {y})")
-            print(f"  Type the arm angle for this point (e.g. 30): ", end="", flush=True)
+            need_click[0] = False  # now we need an angle typed
 
     cv2.namedWindow("Calibration")
     cv2.setMouseCallback("Calibration", on_click)
 
     print("=== CALIBRATION ===")
     print("Place object at 3 different known angles along the arm's arc.")
-    print("For each: click on the object, then type its angle in the terminal.")
-    print("Example: place at 20°, 45°, 70° (spread them out for accuracy)")
-    print("Press 'r' to redo, 's' to save when all 3 are done.")
+    print("For each: click on the object, then type its angle and press Enter.")
+    print("Example: place at 20, 45, 70 (spread them out for accuracy)")
+    print("Press 'r' in the window to redo, 's' to save when all 3 are done.")
     print()
+    print(f"Click on object at known angle (1/3)")
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        # If we have a click but no angle for it, ask for input (blocking)
+        if not need_click[0] and len(angles) < len(clicks):
+            try:
+                line = input("  Enter angle for this point: ").strip()
+                ang = float(line)
+                angles.append(ang)
+                need_click[0] = True
+                print(f"  Recorded: {ang} deg")
+                if len(angles) < 3:
+                    print(f"\nClick on object at known angle ({len(angles)+1}/3)")
+                else:
+                    print(f"\nAll 3 points recorded. Press 's' in the window to save, 'r' to redo.")
+            except ValueError:
+                print("  Invalid number, try again.")
+                continue
 
-        # Crop and resize to 320x320
-        if cam_w != cam_h:
-            size = min(cam_w, cam_h)
-            x_off = (cam_w - size) // 2
-            y_off = (cam_h - size) // 2
-            cropped = frame[y_off:y_off + size, x_off:x_off + size]
-        else:
-            cropped = frame
-        frame = cv2.resize(cropped, (MODEL_INPUT_W, MODEL_INPUT_H))
+        frame = grab_frame(cap, cam_w, cam_h)
+        if frame is None:
+            break
 
         # Draw existing clicks
         colors = [(0, 255, 0), (255, 255, 0), (255, 0, 0)]
@@ -149,7 +164,7 @@ def calibrate():
             if i < len(angles):
                 lbl = f"{angles[i]} deg"
             else:
-                lbl = "? deg"
+                lbl = "..."
             cv2.putText(frame, lbl, (cx + 10, cy - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[i], 2)
 
@@ -157,8 +172,6 @@ def calibrate():
         done = len(clicks) == 3 and len(angles) == 3
         if done:
             msg = "Press 's' to save, 'r' to redo"
-        elif len(clicks) > len(angles):
-            msg = "Type the angle in the terminal..."
         else:
             msg = f"Click on object at known angle ({len(clicks)+1}/3)"
 
@@ -168,38 +181,13 @@ def calibrate():
         cv2.imshow("Calibration", frame)
         key = cv2.waitKey(50) & 0xFF
 
-        # Check if user needs to enter an angle
-        if len(clicks) > len(angles):
-            try:
-                import select
-                if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-                    line = sys.stdin.readline().strip()
-                    if line:
-                        angles.append(float(line))
-                        print(f"  Angle recorded: {angles[-1]}°")
-                        if len(angles) < 3:
-                            print(f"\n  Place object at next angle and click ({len(angles)+1}/3)")
-            except (ImportError, OSError):
-                import msvcrt
-                if msvcrt.kbhit():
-                    line = ""
-                    while msvcrt.kbhit():
-                        ch = msvcrt.getche().decode()
-                        if ch in ('\r', '\n'):
-                            break
-                        line += ch
-                    if line:
-                        angles.append(float(line))
-                        print(f"\n  Angle recorded: {angles[-1]}°")
-                        if len(angles) < 3:
-                            print(f"\n  Place object at next angle and click ({len(angles)+1}/3)")
-
         if key == ord("q"):
             break
         elif key == ord("r"):
             clicks.clear()
             angles.clear()
-            print("\nReset. Click again.")
+            need_click[0] = True
+            print("\nReset. Click on object at known angle (1/3)")
         elif key == ord("s") and done:
             # Find arm base from 3 points on the arc
             result = find_circle_center(clicks[0], clicks[1], clicks[2])
@@ -208,6 +196,7 @@ def calibrate():
                 print("Make sure the 3 points are spread along the arc, not in a line.")
                 clicks.clear()
                 angles.clear()
+                need_click[0] = True
                 continue
 
             bx, by = result
@@ -243,10 +232,10 @@ def calibrate():
                 json.dump(cal, f, indent=2)
 
             print(f"\nCalibration saved to {CALIBRATION_FILE}")
-            print(f"  Arm base (computed): ({bx:.1f}, {by:.1f}) - off-screen is OK!")
+            print(f"  Arm base (computed): ({bx:.1f}, {by:.1f})")
             print(f"  Arm radius: {radius:.1f} px")
             for i in range(3):
-                print(f"  Point {i+1}: {clicks[i]} = {angles[i]}°")
+                print(f"  Point {i+1}: {clicks[i]} = {angles[i]} deg")
             print(f"  Mapping: raw = {m:.4f} * degree + {b:.4f}")
             break
 
@@ -284,19 +273,9 @@ def detect():
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            frame = grab_frame(cap, cam_w, cam_h)
+            if frame is None:
                 break
-
-            # Crop and resize to 320x320
-            if cam_w != cam_h:
-                size = min(cam_w, cam_h)
-                x_off = (cam_w - size) // 2
-                y_off = (cam_h - size) // 2
-                cropped = frame[y_off:y_off + size, x_off:x_off + size]
-            else:
-                cropped = frame
-            frame = cv2.resize(cropped, (MODEL_INPUT_W, MODEL_INPUT_H))
 
             # Prepare input
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -324,17 +303,19 @@ def detect():
                 else:
                     flat_tensors.append(tensor[0])
 
-            a, b = flat_tensors[0], flat_tensors[1]
+            a, b_tens = flat_tensors[0], flat_tensors[1]
             if np.allclose(a, np.round(a), atol=0.1):
-                classes, scores = a, b
+                classes, scores = a, b_tens
             else:
-                scores, classes = a, b
+                scores, classes = a, b_tens
             num_detections = min(num_detections, len(scores))
 
-            # Draw arm base
-            cv2.circle(frame, (bx, by), 6, (0, 0, 255), -1)
-            cv2.putText(frame, "BASE", (bx + 8, by - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            # Draw arm base if on screen
+            bx_int, by_int = int(bx), int(by)
+            if 0 <= bx_int < MODEL_INPUT_W and 0 <= by_int < MODEL_INPUT_H:
+                cv2.circle(frame, (bx_int, by_int), 6, (0, 0, 255), -1)
+                cv2.putText(frame, "BASE", (bx_int + 8, by_int - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
             # Process detections
             for i in range(num_detections):
@@ -363,7 +344,6 @@ def detect():
                 color = (0, 255, 0) if label == "Cube" else (255, 0, 0)
                 cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
                 cv2.circle(frame, (int(pixel_x), int(pixel_y)), 5, color, -1)
-                cv2.line(frame, (bx, by), (int(pixel_x), int(pixel_y)), color, 1)
                 text = f"{label} {angle:.1f} deg"
                 cv2.putText(frame, text, (px1, py1 - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
