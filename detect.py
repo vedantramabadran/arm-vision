@@ -1,55 +1,93 @@
 #!/usr/bin/env python3
 """
-Object detection using Edge Impulse model.
+Object detection using Edge Impulse TFLite model.
 Captures from webcam, runs inference, prints pixel coordinates of detected objects.
+
+Usage:
+  1. Export model from Edge Impulse as "TensorFlow Lite (float32)"
+  2. Place the .tflite file in this directory
+  3. pip install -r requirements.txt
+  4. python detect.py
 """
 
 import cv2
 import os
 import sys
-import json
-import time
+import glob
 import numpy as np
-from edge_impulse_linux.image import ImageImpulseRunner
 
-# Path to your .eim model file
-# Download from: Edge Impulse Studio → Deployment → macOS (or Linux) → Build
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.eim")
+try:
+    from tflite_runtime.interpreter import Interpreter
+except ImportError:
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+    except ImportError:
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
 
+# Labels from the Edge Impulse model
+LABELS = ["Cube", "Cyl"]
+
+# Find .tflite model file automatically
+MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIDENCE_THRESHOLD = 0.5
 CAMERA_INDEX = 0  # Change if you have multiple cameras
 
+# Model input size (from model_metadata.h)
+MODEL_INPUT_W = 320
+MODEL_INPUT_H = 320
 
-def main():
-    if not os.path.exists(MODEL_PATH):
-        print("ERROR: Model file not found at:", MODEL_PATH)
+
+def find_model():
+    """Find the .tflite file in the current directory."""
+    tflite_files = glob.glob(os.path.join(MODEL_DIR, "*.tflite"))
+    if not tflite_files:
+        print("ERROR: No .tflite file found in", MODEL_DIR)
         print()
-        print("To get the .eim file:")
+        print("To get the .tflite file:")
         print("  1. Go to https://studio.edgeimpulse.com/studio/938802")
         print("  2. Click 'Deployment' in the left sidebar")
-        print("  3. Search for 'macOS' (or 'Linux' if on Linux)")
-        print("  4. Click 'Build'")
-        print("  5. Save the downloaded .eim file as 'model.eim' in this directory")
+        print("  3. Change deployment target to 'TensorFlow Lite'")
+        print("  4. Select float32")
+        print("  5. Click 'Build' and extract the .tflite file here")
         sys.exit(1)
+    if len(tflite_files) > 1:
+        print(f"Found multiple .tflite files, using: {tflite_files[0]}")
+    return tflite_files[0]
 
-    # Load model
-    runner = ImageImpulseRunner(MODEL_PATH)
-    model_info = runner.init()
 
-    print("Model:", model_info["project"]["name"])
-    print("Labels:", model_info["model_parameters"]["labels"])
-    print("Input size:", model_info["model_parameters"]["image_input_width"], "x",
-          model_info["model_parameters"]["image_input_height"])
+def main():
+    model_path = find_model()
+    print(f"Loading model: {os.path.basename(model_path)}")
+
+    # Load TFLite model
+    interpreter = Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    # Print model info
+    input_shape = input_details[0]["shape"]
+    input_dtype = input_details[0]["dtype"]
+    print(f"Input:  {input_shape} dtype={input_dtype.__name__}")
+    print(f"Outputs: {len(output_details)} tensors")
+    for i, od in enumerate(output_details):
+        print(f"  [{i}] {od['name']}: shape={od['shape']} dtype={od['dtype'].__name__}")
+    print(f"Labels: {LABELS}")
     print()
 
-    input_w = model_info["model_parameters"]["image_input_width"]
-    input_h = model_info["model_parameters"]["image_input_height"]
+    # Get quantization params if int8
+    is_quantized = input_dtype == np.int8 or input_dtype == np.uint8
+    if is_quantized:
+        input_scale = input_details[0]["quantization"][0]
+        input_zero_point = input_details[0]["quantization"][1]
+        print(f"Quantized model: scale={input_scale}, zero_point={input_zero_point}")
 
     # Open camera
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print("ERROR: Could not open camera", CAMERA_INDEX)
-        runner.stop()
+        print(f"ERROR: Could not open camera {CAMERA_INDEX}")
         sys.exit(1)
 
     cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -65,79 +103,110 @@ def main():
                 print("Failed to grab frame")
                 break
 
-            # Crop to square (center crop) to match model input aspect ratio
+            # Center crop to square
             if cam_w != cam_h:
                 size = min(cam_w, cam_h)
                 x_off = (cam_w - size) // 2
                 y_off = (cam_h - size) // 2
-                cropped = frame[y_off:y_off+size, x_off:x_off+size]
+                cropped = frame[y_off:y_off + size, x_off:x_off + size]
             else:
                 cropped = frame
                 size = cam_w
                 x_off = 0
                 y_off = 0
 
-            # Resize to model input size
-            resized = cv2.resize(cropped, (input_w, input_h))
+            # Resize to model input
+            resized = cv2.resize(cropped, (MODEL_INPUT_W, MODEL_INPUT_H))
 
-            # Convert to RGB features for Edge Impulse
-            features = []
-            for row in resized:
-                for pixel in row:
-                    b, g, r = int(pixel[0]), int(pixel[1]), int(pixel[2])
-                    features.append((r << 16) | (g << 8) | b)
+            # Convert BGR to RGB
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+            # Prepare input tensor
+            if is_quantized:
+                input_data = (rgb.astype(np.float32) / input_scale + input_zero_point).astype(input_dtype)
+            else:
+                input_data = (rgb.astype(np.float32) / 255.0)
+
+            input_data = np.expand_dims(input_data, axis=0)
 
             # Run inference
-            res = runner.classify(features)
-            bboxes = res["result"].get("bounding_boxes", [])
+            interpreter.set_tensor(input_details[0]["index"], input_data)
+            interpreter.invoke()
+
+            # SSD output tensors - identify by shape
+            flat_tensors = []  # [1, N] shaped tensors
+            for od in output_details:
+                tensor = interpreter.get_tensor(od["index"])
+                shape = tuple(tensor.shape)
+                if len(shape) == 3 and shape[2] == 4:
+                    boxes = tensor[0]           # [1, N, 4] = bounding boxes
+                elif len(shape) == 1:
+                    num_detections = int(tensor.item())  # [1] = count
+                else:
+                    flat_tensors.append(tensor[0])  # [1, N] = scores or classes
+
+            # Distinguish scores from classes: class indices are near-integer,
+            # scores are fractional floats spread across [0, 1]
+            a, b = flat_tensors[0], flat_tensors[1]
+            a_is_classes = np.allclose(a, np.round(a), atol=0.1)
+            if a_is_classes:
+                classes, scores = a, b
+            else:
+                scores, classes = a, b
+
+            num_detections = min(num_detections, len(scores))
 
             # Process detections
             detections = []
-            for bb in bboxes:
-                if bb["value"] < CONFIDENCE_THRESHOLD:
+            for i in range(num_detections):
+                confidence = float(scores[i])
+                if confidence < CONFIDENCE_THRESHOLD:
                     continue
 
-                # Bounding box in model coordinates (0 to input_w/input_h)
-                mx = bb["x"]
-                my = bb["y"]
-                mw = bb["width"]
-                mh = bb["height"]
+                class_id = int(classes[i])
+                if class_id < 0 or class_id >= len(LABELS):
+                    continue
+                label = LABELS[class_id]
 
-                # Center of bounding box in model pixel space
-                center_mx = mx + mw / 2
-                center_my = my + mh / 2
+                # Bounding box in normalized coordinates [y1, x1, y2, x2]
+                y1, x1, y2, x2 = boxes[i]
 
-                # Scale back to cropped image coordinates
-                scale = size / input_w
-                cx = center_mx * scale
-                cy = center_my * scale
+                # Convert to model pixel coordinates
+                mx1 = x1 * MODEL_INPUT_W
+                my1 = y1 * MODEL_INPUT_H
+                mx2 = x2 * MODEL_INPUT_W
+                my2 = y2 * MODEL_INPUT_H
 
-                # Offset to full frame coordinates
-                pixel_x = cx + x_off
-                pixel_y = cy + y_off
+                # Center of bounding box in model space
+                center_mx = (mx1 + mx2) / 2
+                center_my = (my1 + my2) / 2
+
+                # Scale to cropped image coordinates, then offset to full frame
+                scale = size / MODEL_INPUT_W
+                pixel_x = center_mx * scale + x_off
+                pixel_y = center_my * scale + y_off
 
                 # Bounding box in full frame coordinates
-                box_x = int(mx * scale + x_off)
-                box_y = int(my * scale + y_off)
-                box_w = int(mw * scale)
-                box_h = int(mh * scale)
+                box_x1 = int(mx1 * scale + x_off)
+                box_y1 = int(my1 * scale + y_off)
+                box_x2 = int(mx2 * scale + x_off)
+                box_y2 = int(my2 * scale + y_off)
 
                 det = {
-                    "label": bb["label"],
-                    "confidence": round(bb["value"], 3),
+                    "label": label,
+                    "confidence": round(confidence, 3),
                     "pixel_x": round(pixel_x, 1),
                     "pixel_y": round(pixel_y, 1),
-                    "bbox": [box_x, box_y, box_w, box_h],
+                    "bbox": [box_x1, box_y1, box_x2, box_y2],
                 }
                 detections.append(det)
 
                 # Draw on frame
-                color = (0, 255, 0) if bb["label"] == "Cube" else (255, 0, 0)
-                cv2.rectangle(frame, (box_x, box_y),
-                              (box_x + box_w, box_y + box_h), color, 2)
+                color = (0, 255, 0) if label == "Cube" else (255, 0, 0)
+                cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), color, 2)
                 cv2.circle(frame, (int(pixel_x), int(pixel_y)), 5, (0, 0, 255), -1)
-                label_text = f"{bb['label']} {bb['value']:.2f} ({pixel_x:.0f},{pixel_y:.0f})"
-                cv2.putText(frame, label_text, (box_x, box_y - 8),
+                text = f"{label} {confidence:.2f} ({pixel_x:.0f},{pixel_y:.0f})"
+                cv2.putText(frame, text, (box_x1, box_y1 - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             # Print detections
@@ -155,7 +224,6 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        runner.stop()
 
 
 if __name__ == "__main__":
