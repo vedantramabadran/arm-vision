@@ -31,7 +31,7 @@ LABELS = ["Cube", "Cyl"]
 # Find .tflite model file automatically
 MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIDENCE_THRESHOLD = 0.5
-CAMERA_INDEX = 0  # Change if you have multiple cameras
+CAMERA_INDEX = 1  # Change if you have multiple cameras
 
 # Model input size (from model_metadata.h)
 MODEL_INPUT_W = 320
@@ -103,7 +103,7 @@ def main():
                 print("Failed to grab frame")
                 break
 
-            # Center crop to square
+            # Center crop to square and resize to 320x320
             if cam_w != cam_h:
                 size = min(cam_w, cam_h)
                 x_off = (cam_w - size) // 2
@@ -111,12 +111,10 @@ def main():
                 cropped = frame[y_off:y_off + size, x_off:x_off + size]
             else:
                 cropped = frame
-                size = cam_w
-                x_off = 0
-                y_off = 0
 
-            # Resize to model input
-            resized = cv2.resize(cropped, (MODEL_INPUT_W, MODEL_INPUT_H))
+            # Resize to model input - this is our display frame too
+            frame = cv2.resize(cropped, (MODEL_INPUT_W, MODEL_INPUT_H))
+            resized = frame.copy()
 
             # Convert BGR to RGB
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
@@ -171,26 +169,21 @@ def main():
                 # Bounding box in normalized coordinates [y1, x1, y2, x2]
                 y1, x1, y2, x2 = boxes[i]
 
-                # Convert to model pixel coordinates
-                mx1 = x1 * MODEL_INPUT_W
-                my1 = y1 * MODEL_INPUT_H
-                mx2 = x2 * MODEL_INPUT_W
-                my2 = y2 * MODEL_INPUT_H
+                # Convert normalized coords to 320x320 pixel coordinates
+                px1 = x1 * MODEL_INPUT_W
+                py1 = y1 * MODEL_INPUT_H
+                px2 = x2 * MODEL_INPUT_W
+                py2 = y2 * MODEL_INPUT_H
 
-                # Center of bounding box in model space
-                center_mx = (mx1 + mx2) / 2
-                center_my = (my1 + my2) / 2
+                # Center of bounding box
+                pixel_x = (px1 + px2) / 2
+                pixel_y = (py1 + py2) / 2
 
-                # Scale to cropped image coordinates, then offset to full frame
-                scale = size / MODEL_INPUT_W
-                pixel_x = center_mx * scale + x_off
-                pixel_y = center_my * scale + y_off
-
-                # Bounding box in full frame coordinates
-                box_x1 = int(mx1 * scale + x_off)
-                box_y1 = int(my1 * scale + y_off)
-                box_x2 = int(mx2 * scale + x_off)
-                box_y2 = int(my2 * scale + y_off)
+                # Bounding box corners (clipped to frame)
+                box_x1 = max(0, int(px1))
+                box_y1 = max(0, int(py1))
+                box_x2 = min(MODEL_INPUT_W, int(px2))
+                box_y2 = min(MODEL_INPUT_H, int(py2))
 
                 det = {
                     "label": label,
